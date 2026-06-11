@@ -32,13 +32,8 @@ Content-Type: application/json
 }
 ```
 
-The route endpoint is implemented with DRF `CreateAPIView`.
-
-Fuel stations can be inspected with the DRF `ListAPIView` endpoint:
-
-```http
-GET /api/fuel-stations/?state=OH&geocoded=true
-```
+The route endpoint is implemented with DRF `CreateAPIView`. A lightweight
+health endpoint is also available at `GET /api/health/`.
 
 ## How It Works
 
