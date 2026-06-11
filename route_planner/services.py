@@ -332,7 +332,7 @@ class StationIndex:
         )
         if not stations:
             raise PlanningError(
-                "FuelStation table has no geocoded rows. Run import_fuel_stations and geocode_fuel_stations first."
+                "FuelStation table has no geocoded rows. Run import_fuel_stations first."
             )
         return cls(stations)
 

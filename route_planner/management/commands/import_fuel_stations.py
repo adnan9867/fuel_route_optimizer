@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import csv
+import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib import parse
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
 
 from route_planner.models import FuelStation
+from route_planner.services import _get_json
+
+
+NOMINATIM_SLEEP_SECONDS = 1.0
+GEOCODE_PROGRESS_INTERVAL = 25
 
 
 class Command(BaseCommand):
@@ -77,6 +85,92 @@ class Command(BaseCommand):
             )
         )
 
+        geocoded = geocode_missing_stations(
+            stdout=self.stdout,
+            success_style=self.style.SUCCESS,
+            warning_style=self.style.WARNING,
+        )
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Geocoded {geocoded} fuel stations with Nominatim."
+            )
+        )
+
 
 def clean(value: object) -> str:
     return " ".join(str(value or "").strip().split())
+
+
+def geocode_missing_stations(stdout, success_style, warning_style) -> int:
+    queryset = FuelStation.objects.filter(
+        is_active=True,
+        latitude__isnull=True,
+        longitude__isnull=True,
+    ).order_by("id")
+    total = queryset.count()
+    if total == 0:
+        stdout.write(success_style("No fuel stations are missing coordinates."))
+        return 0
+
+    updated = 0
+    stdout.write(
+        f"Geocoding {total} fuel stations with Nominatim "
+        f"(sleep={NOMINATIM_SLEEP_SECONDS}s between requests)."
+    )
+    for index, station in enumerate(queryset.iterator(chunk_size=100), start=1):
+        payload = _get_json(nominatim_url(station), timeout=15)
+        if payload:
+            station.latitude = Decimal(payload[0]["lat"]).quantize(Decimal("0.0000001"))
+            station.longitude = Decimal(payload[0]["lon"]).quantize(Decimal("0.0000001"))
+            station.geocode_source = "nominatim"
+            station.geocoded_at = timezone.now()
+            station.save(
+                update_fields=[
+                    "latitude",
+                    "longitude",
+                    "geocode_source",
+                    "geocoded_at",
+                    "updated_at",
+                ]
+            )
+            updated += 1
+            status = "geocoded"
+        else:
+            status = "no result"
+
+        if index == 1 or index == total or index % GEOCODE_PROGRESS_INTERVAL == 0:
+            stdout.write(
+                f"[{index}/{total}] {status}: "
+                f"{station.truckstop_name} ({station.city}, {station.state})"
+            )
+        time.sleep(NOMINATIM_SLEEP_SECONDS)
+
+    if updated < total:
+        stdout.write(
+            warning_style(
+                f"Nominatim returned no result for {total - updated} fuel stations."
+            )
+        )
+    return updated
+
+
+def nominatim_url(station: FuelStation) -> str:
+    query = ", ".join(
+        part
+        for part in [
+            station.address,
+            station.city,
+            station.state,
+            "USA",
+        ]
+        if part
+    )
+    params = parse.urlencode(
+        {
+            "q": query,
+            "format": "jsonv2",
+            "limit": "1",
+            "countrycodes": "us",
+        }
+    )
+    return f"https://nominatim.openstreetmap.org/search?{params}"

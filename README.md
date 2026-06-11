@@ -9,7 +9,6 @@ from the provided CSV data, and returns route geometry plus fuel cost details.
 ```bash
 ./venv/bin/python manage.py migrate
 ./venv/bin/python manage.py import_fuel_stations
-./venv/bin/python manage.py geocode_fuel_stations
 ./venv/bin/python manage.py runserver
 ```
 
@@ -17,14 +16,10 @@ The CSV file is not edited. It is imported once into the `FuelStation` table.
 The import command upserts by `opis_truckstop_id`, so running it again updates
 existing rows instead of creating duplicates.
 
-Latitude and longitude are stored in the database after the one-time station
-geocoding step. `geocode_fuel_stations` uses Nominatim address geocoding by
-default for better station matching. For a quick local demo, this faster fallback
-is available:
-
-```bash
-./venv/bin/python manage.py geocode_fuel_stations --provider city-centroid
-```
+Latitude and longitude are stored in the database during the import command.
+Station geocoding uses Nominatim only, runs before API traffic, and prints
+progress while processing missing coordinates. Nominatim rate limits are respected
+with a hardcoded one-second delay between station geocoding requests.
 
 Route app models inherit the shared `common.model_mixins.TimestampMixin`, so
 they consistently include `created_at`, `updated_at`, and `is_active`.
