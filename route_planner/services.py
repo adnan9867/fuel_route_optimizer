@@ -123,23 +123,33 @@ def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
     route = fetch_route(start, finish)
 
     distance_miles = route["distance_miles"]
-    samples = sample_route(route["coordinates"], distance_miles)
-    station_index = StationIndex.from_database()
-
-    selected_radius = None
     candidates: list[CandidateStation] = []
-    fuel_plan: dict[str, Any] | None = None
-    for radius in CORRIDOR_FALLBACK_MILES:
-        candidates = station_index.candidates_near_route(samples, distance_miles, radius)
-        try:
-            fuel_plan = choose_fuel_stops(distance_miles, candidates, radius)
-        except PlanningError:
-            continue
-        selected_radius = radius
-        break
+    selected_radius = None
+    database_station_count = None
 
-    if fuel_plan is None or selected_radius is None:
-        raise PlanningError("No fuel station from provided CSV found near this route.")
+    if distance_miles <= SAFE_RANGE_MILES:
+        fuel_plan = choose_fuel_stops(
+            distance_miles,
+            candidates,
+            CORRIDOR_FALLBACK_MILES[0],
+        )
+    else:
+        samples = sample_route(route["coordinates"], distance_miles)
+        station_index = StationIndex.from_database()
+        database_station_count = station_index.station_count
+        fuel_plan = None
+
+        for radius in CORRIDOR_FALLBACK_MILES:
+            candidates = station_index.candidates_near_route(samples, distance_miles, radius)
+            try:
+                fuel_plan = choose_fuel_stops(distance_miles, candidates, radius)
+            except PlanningError:
+                continue
+            selected_radius = radius
+            break
+
+        if fuel_plan is None or selected_radius is None:
+            raise PlanningError("No fuel station from provided CSV found near this route.")
 
     route_coordinates = [point.as_geojson_position() for point in route["coordinates"]]
     return {
@@ -166,7 +176,7 @@ def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
         "station_search": {
             "corridor_radius_miles": selected_radius,
             "candidate_count": len(candidates),
-            "database_station_count": station_index.station_count,
+            "database_station_count": database_station_count,
         },
         "map": build_feature_collection(
             route_coordinates=route_coordinates,

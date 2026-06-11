@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.test import SimpleTestCase
 from django.urls import reverse
@@ -10,6 +11,7 @@ from .services import (
     Coordinate,
     choose_fuel_stops,
     fuel_leg_cost,
+    plan_route,
     sample_route,
 )
 
@@ -124,6 +126,34 @@ class FuelPlannerTests(SimpleTestCase):
 
 
 class RoutePlanViewTests(SimpleTestCase):
+    def test_short_route_does_not_load_fuel_station_catalog(self) -> None:
+        with (
+            patch(
+                "route_planner.services.geocode_location",
+                side_effect=[Coordinate(40.0, -75.0), Coordinate(41.0, -74.0)],
+            ),
+            patch(
+                "route_planner.services.fetch_route",
+                return_value={
+                    "distance_miles": 120.0,
+                    "duration_minutes": 150.0,
+                    "coordinates": [
+                        Coordinate(40.0, -75.0),
+                        Coordinate(41.0, -74.0),
+                    ],
+                },
+            ),
+            patch(
+                "route_planner.services.StationIndex.from_database",
+                side_effect=AssertionError("FuelStation table should not be loaded"),
+            ),
+        ):
+            result = plan_route("Start, PA", "Finish, NY")
+
+        self.assertEqual(result["fuel_plan"]["selected_fuel_stops"], [])
+        self.assertEqual(result["fuel_plan"]["total_route_gallons"], 12.0)
+        self.assertIsNone(result["station_search"]["database_station_count"])
+
     def test_missing_locations_returns_400(self) -> None:
         response = self.client.post(
             reverse("route-plan"),
