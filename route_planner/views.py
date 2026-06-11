@@ -39,7 +39,7 @@ class FuelStationListAPIView(BaseAPIView, ListAPIView):
     serializer_class = FuelStationSerializer
 
     def get_queryset(self) -> QuerySet[FuelStation]:
-        queryset = FuelStation.objects.all()
+        queryset = FuelStation.objects.filter(is_active=True)
         state = self.request.query_params.get("state")
         geocoded = self.request.query_params.get("geocoded")
 

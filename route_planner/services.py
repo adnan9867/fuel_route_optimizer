@@ -194,7 +194,7 @@ def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
 
 def geocode_location(location: str) -> Coordinate:
     query = normalize_location(location)
-    cached = GeocodeCache.objects.filter(query=query).first()
+    cached = GeocodeCache.objects.filter(query=query, is_active=True).first()
     if cached is not None:
         return Coordinate(float(cached.latitude), float(cached.longitude))
 
@@ -228,6 +228,7 @@ def geocode_location(location: str) -> Coordinate:
                 "longitude": longitude,
                 "display_name": display_name,
                 "provider": "nominatim",
+                "is_active": True,
             },
         )
 
@@ -236,7 +237,7 @@ def geocode_location(location: str) -> Coordinate:
 
 def fetch_route(start: Coordinate, finish: Coordinate) -> dict[str, Any]:
     cache_key = route_cache_key(start, finish)
-    cached = RouteCache.objects.filter(cache_key=cache_key).first()
+    cached = RouteCache.objects.filter(cache_key=cache_key, is_active=True).first()
     if cached is not None:
         return {
             "distance_miles": cached.distance_miles,
@@ -287,6 +288,7 @@ def fetch_route(start: Coordinate, finish: Coordinate) -> dict[str, Any]:
             "duration_minutes": duration_minutes,
             "geometry": geometry,
             "provider": "osrm",
+            "is_active": True,
         },
     )
     return {
@@ -309,6 +311,7 @@ class StationIndex:
     def from_database(cls) -> "StationIndex":
         stations = list(
             FuelStation.objects.filter(
+                is_active=True,
                 latitude__isnull=False,
                 longitude__isnull=False,
                 state__in=US_STATE_CODES,

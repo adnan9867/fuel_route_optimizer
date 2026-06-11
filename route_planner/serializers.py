@@ -32,4 +32,5 @@ class FuelStationSerializer(serializers.ModelSerializer):
             "latitude",
             "longitude",
             "geocode_source",
+            "is_active",
         ]

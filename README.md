@@ -17,6 +17,9 @@ The CSV file is not edited. It is imported once into the `FuelStation` table.
 Latitude and longitude are stored in the database after the one-time station
 geocoding step.
 
+Route app models inherit the shared `common.model_mixins.TimestampMixin`, so
+they consistently include `created_at`, `updated_at`, and `is_active`.
+
 ## API
 
 ```http

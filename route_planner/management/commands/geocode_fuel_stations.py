@@ -53,7 +53,11 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options) -> None:
-        queryset = FuelStation.objects.filter(latitude__isnull=True, longitude__isnull=True)
+        queryset = FuelStation.objects.filter(
+            is_active=True,
+            latitude__isnull=True,
+            longitude__isnull=True,
+        )
         if options["limit"]:
             queryset = queryset[: options["limit"]]
 
