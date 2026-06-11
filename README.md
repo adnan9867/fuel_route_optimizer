@@ -48,7 +48,8 @@ The route endpoint is implemented with DRF `CreateAPIView`.
 1. `FuelStation` rows are imported from `fuel-prices-for-be-assessment.csv`.
 2. Station coordinates are geocoded once and saved in the database.
 3. Start and finish locations are geocoded with Nominatim.
-4. Start/finish geocoding results are saved in `GeocodeCache`.
+4. Start/finish geocoding results are saved in `GeocodeCache` using a
+   case-insensitive normalized key.
 5. OSRM calculates the route from the cached coordinates.
 6. OSRM route geometry, distance, and duration are saved in `RouteCache`.
 7. The route is sampled and matched against geocoded CSV fuel stations.
@@ -58,8 +59,8 @@ The route endpoint is implemented with DRF `CreateAPIView`.
 10. The vehicle is assumed to start with a full tank.
 11. The vehicle maximum range is 500 miles, but stop planning uses a 480-mile
    safety range.
-12. The planner selects the minimum required number of stops, then chooses the
-   lowest-cost feasible stop chain.
+12. The planner tries the minimum required number of stops first. If station
+   placement makes that infeasible, it retries with extra stops.
 13. Each selected stop pays for the next leg, not the miles already driven:
 
 ```text
@@ -91,6 +92,8 @@ Responses use the shared `BaseAPIView` envelope:
 - fuel cost per stop
 - estimated detour cost
 - total fuel cost
+- en-route fuel purchase cost
+- selected stop purchase cost
 - total route gallons consumed
 - total gallons purchased after the initial full tank
 
@@ -107,6 +110,9 @@ during route requests.
 - Start and finish locations are inside the USA.
 - The vehicle starts with a full tank.
 - The initial full tank is not counted as an en-route purchase.
+- `total_route_gallons` shows total fuel consumed for the whole route.
+- `en_route_fuel_cost_usd` and `selected_stop_purchase_cost_usd` show fuel bought
+  after the initial full tank.
 - Routes up to 480 miles require no fuel stop.
 - A 760 or 900 mile route generally requires one fuel stop.
 - A 1200 mile route generally requires two fuel stops.

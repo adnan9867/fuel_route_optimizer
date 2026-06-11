@@ -45,6 +45,8 @@ class FuelPlannerTests(SimpleTestCase):
 
         self.assertEqual(plan["selected_fuel_stops"], [])
         self.assertEqual(plan["total_fuel_cost_usd"], 0.0)
+        self.assertEqual(plan["en_route_fuel_cost_usd"], 0.0)
+        self.assertEqual(plan["selected_stop_purchase_cost_usd"], 0.0)
         self.assertEqual(plan["total_route_gallons"], 40.0)
         self.assertTrue(plan["assumptions"]["starts_with_full_tank"])
 
@@ -59,6 +61,23 @@ class FuelPlannerTests(SimpleTestCase):
         self.assertEqual(len(plan["selected_fuel_stops"]), 1)
         self.assertEqual(plan["selected_fuel_stops"][0]["truckstop_name"], "needed_stop")
         self.assertEqual(plan["selected_fuel_stops"][0]["next_route_mile"], 760.0)
+        self.assertEqual(plan["minimum_required_stops"], 1)
+        self.assertEqual(plan["planned_stop_count"], 1)
+
+    def test_tries_extra_stop_when_minimum_stop_count_is_infeasible(self) -> None:
+        candidates = [
+            self._candidate("first_stop", 300.0, 3.10, 1.0),
+            self._candidate("second_stop", 700.0, 3.25, 1.0),
+        ]
+
+        plan = choose_fuel_stops(900.0, candidates, corridor_radius_miles=10.0)
+
+        self.assertEqual(plan["minimum_required_stops"], 1)
+        self.assertEqual(plan["planned_stop_count"], 2)
+        self.assertEqual(
+            [stop["truckstop_name"] for stop in plan["selected_fuel_stops"]],
+            ["first_stop", "second_stop"],
+        )
 
     def test_full_tank_route_uses_two_stops_for_1200_miles(self) -> None:
         candidates = [

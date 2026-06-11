@@ -22,6 +22,7 @@ MILES_PER_GALLON = 10.0
 ROUTE_SAMPLE_INTERVAL_MILES = 5.0
 STATION_GRID_DEGREES = 1.0
 CORRIDOR_FALLBACK_MILES = (10.0, 25.0, 50.0)
+EXTRA_STOP_ATTEMPTS = 2
 US_STATE_CODES = {
     "AL",
     "AK",
@@ -184,7 +185,8 @@ def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
 
 def geocode_location(location: str) -> Coordinate:
     query = normalize_location(location)
-    cached = GeocodeCache.objects.filter(query=query, is_active=True).first()
+    cache_query = query.casefold()
+    cached = GeocodeCache.objects.filter(query=cache_query, is_active=True).first()
     if cached is not None:
         return Coordinate(float(cached.latitude), float(cached.longitude))
 
@@ -212,7 +214,7 @@ def geocode_location(location: str) -> Coordinate:
 
     with transaction.atomic():
         GeocodeCache.objects.update_or_create(
-            query=query,
+            query=cache_query,
             defaults={
                 "latitude": latitude,
                 "longitude": longitude,
@@ -391,18 +393,38 @@ def choose_fuel_stops(
     if required_stop_count == 0:
         return {
             "total_fuel_cost_usd": 0.0,
+            "en_route_fuel_cost_usd": 0.0,
+            "en_route_fuel_purchase_cost_usd": 0.0,
+            "selected_stop_purchase_cost_usd": 0.0,
             "total_route_gallons": round(route_gallons, 2),
             "total_purchased_gallons": 0.0,
             "total_detour_cost_usd": 0.0,
+            "detour_fuel_cost_usd": 0.0,
             "selected_fuel_stops": [],
             "assumptions": fuel_assumptions(),
         }
 
-    stages = candidate_stages(distance_miles, candidates, required_stop_count)
-    path = cheapest_stop_path(distance_miles, stages, corridor_radius_miles)
+    path = None
+    planned_stop_count = None
+    last_error: PlanningError | None = None
+    max_stop_count = min(len(candidates), required_stop_count + EXTRA_STOP_ATTEMPTS)
+    for stop_count in range(required_stop_count, max_stop_count + 1):
+        try:
+            stages = candidate_stages(distance_miles, candidates, stop_count)
+            path = cheapest_stop_path(distance_miles, stages, corridor_radius_miles)
+        except PlanningError as exc:
+            last_error = exc
+            continue
+        planned_stop_count = stop_count
+        break
+
+    if path is None or planned_stop_count is None:
+        raise last_error or PlanningError(
+            "No feasible fuel-stop chain found within the vehicle safety range."
+        )
 
     selected_stops = []
-    total_cost = 0.0
+    selected_stop_purchase_cost = 0.0
     total_detour_cost = 0.0
     total_purchased_gallons = 0.0
 
@@ -410,15 +432,22 @@ def choose_fuel_stops(
         next_mile = path[index + 1].route_mile if index + 1 < len(path) else distance_miles
         stop = serialize_selected_stop(index + 1, candidate, next_mile)
         selected_stops.append(stop)
-        total_cost += stop["fuel_cost_usd"] + stop["detour_cost_usd"]
+        selected_stop_purchase_cost += stop["fuel_cost_usd"]
         total_detour_cost += stop["detour_cost_usd"]
         total_purchased_gallons += stop["gallons_needed"]
 
+    en_route_fuel_cost = selected_stop_purchase_cost + total_detour_cost
     return {
-        "total_fuel_cost_usd": round(total_cost, 2),
+        "total_fuel_cost_usd": round(en_route_fuel_cost, 2),
+        "en_route_fuel_cost_usd": round(en_route_fuel_cost, 2),
+        "en_route_fuel_purchase_cost_usd": round(selected_stop_purchase_cost, 2),
+        "selected_stop_purchase_cost_usd": round(selected_stop_purchase_cost, 2),
         "total_route_gallons": round(route_gallons, 2),
         "total_purchased_gallons": round(total_purchased_gallons, 2),
         "total_detour_cost_usd": round(total_detour_cost, 2),
+        "detour_fuel_cost_usd": round(total_detour_cost, 2),
+        "minimum_required_stops": required_stop_count,
+        "planned_stop_count": planned_stop_count,
         "selected_fuel_stops": selected_stops,
         "assumptions": fuel_assumptions(),
     }
@@ -555,6 +584,10 @@ def fuel_assumptions() -> dict[str, Any]:
         "cost_scope": (
             "Fuel cost is calculated for fuel purchased at selected stops along "
             "the route. The initial full tank is not counted as an en-route purchase."
+        ),
+        "extra_stop_strategy": (
+            "The planner starts with the minimum required stop count and retries "
+            "with extra stops when station placement makes the minimum chain infeasible."
         ),
         "effective_cost_formula": (
             "next_leg_gallons * station_price + "
