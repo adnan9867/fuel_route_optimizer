@@ -87,5 +87,8 @@ class RoutePlanViewTests(SimpleTestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("start_location", response.json())
-        self.assertIn("finish_location", response.json())
+        payload = response.json()
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["status_code"], 400)
+        self.assertIn("start_location", payload["message"])
+        self.assertIn("finish_location", payload["message"])

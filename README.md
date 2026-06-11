@@ -58,6 +58,17 @@ effective cost =
 
 ## Response Includes
 
+Responses use the shared `BaseAPIView` envelope:
+
+```json
+{
+  "success": true,
+  "status_code": 200,
+  "message": "Route plan created successfully",
+  "data": {}
+}
+```
+
 - start and finish coordinates
 - total route distance
 - estimated route duration
