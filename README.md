@@ -1,4 +1,4 @@
-# Route Detection API
+# Fleet Fuel Optimizer API
 
 Django REST-style API for the backend assessment. The API accepts two USA
 location names, calculates a driving route, selects cost-effective fuel stops
@@ -8,14 +8,23 @@ from the provided CSV data, and returns route geometry plus fuel cost details.
 
 ```bash
 ./venv/bin/python manage.py migrate
-./venv/bin/python manage.py import_fuel_stations --replace
+./venv/bin/python manage.py import_fuel_stations
 ./venv/bin/python manage.py geocode_fuel_stations
 ./venv/bin/python manage.py runserver
 ```
 
 The CSV file is not edited. It is imported once into the `FuelStation` table.
+The import command upserts by `opis_truckstop_id`, so running it again updates
+existing rows instead of creating duplicates.
+
 Latitude and longitude are stored in the database after the one-time station
-geocoding step.
+geocoding step. `geocode_fuel_stations` uses Nominatim address geocoding by
+default for better station matching. For a quick local demo, this faster fallback
+is available:
+
+```bash
+./venv/bin/python manage.py geocode_fuel_stations --provider city-centroid
+```
 
 Route app models inherit the shared `common.model_mixins.TimestampMixin`, so
 they consistently include `created_at`, `updated_at`, and `is_active`.
@@ -44,12 +53,18 @@ The route endpoint is implemented with DRF `CreateAPIView`.
 6. OSRM route geometry, distance, and duration are saved in `RouteCache`.
 7. The route is sampled and matched against geocoded CSV fuel stations.
 8. The service searches a route corridor using fallback radii: 10, 25, 50 miles.
-9. The route is divided into 500-mile windows.
-10. Each window selects the station with the lowest effective cost:
+9. OSRM is requested with `overview=full` so route-to-station matching uses the
+   full route geometry.
+10. The vehicle is assumed to start with a full tank.
+11. The vehicle maximum range is 500 miles, but stop planning uses a 480-mile
+   safety range.
+12. The planner selects the minimum required number of stops, then chooses the
+   lowest-cost feasible stop chain.
+13. Each selected stop pays for the next leg, not the miles already driven:
 
 ```text
 effective cost =
-  route window gallons * station price
+  next leg gallons * station price
   + (distance from route * 2 / 10 MPG) * station price
 ```
 
@@ -72,10 +87,12 @@ Responses use the shared `BaseAPIView` envelope:
 - GeoJSON route geometry
 - selected fuel stops
 - price per gallon
-- gallons needed per 500-mile window
+- gallons needed for each next leg
 - fuel cost per stop
 - estimated detour cost
 - total fuel cost
+- total route gallons consumed
+- total gallons purchased after the initial full tank
 
 ## External APIs
 
@@ -84,6 +101,15 @@ Responses use the shared `BaseAPIView` envelope:
 
 The API does not read the CSV on each request and does not geocode fuel stations
 during route requests.
+
+## Assumptions
+
+- Start and finish locations are inside the USA.
+- The vehicle starts with a full tank.
+- The initial full tank is not counted as an en-route purchase.
+- Routes up to 480 miles require no fuel stop.
+- A 760 or 900 mile route generally requires one fuel stop.
+- A 1200 mile route generally requires two fuel stops.
 
 ## Tests
 

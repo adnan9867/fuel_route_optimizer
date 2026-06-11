@@ -17,6 +17,7 @@ from .models import FuelStation, GeocodeCache, RouteCache
 
 EARTH_RADIUS_MILES = 3958.7613
 MAX_RANGE_MILES = 500.0
+SAFE_RANGE_MILES = 480.0
 MILES_PER_GALLON = 10.0
 ROUTE_SAMPLE_INTERVAL_MILES = 5.0
 STATION_GRID_DEGREES = 1.0
@@ -112,17 +113,6 @@ class CandidateStation:
     station: FuelStation
     route_mile: float
     distance_from_route_miles: float
-
-
-@dataclass(frozen=True, slots=True)
-class RouteWindow:
-    sequence: int
-    start_mile: float
-    end_mile: float
-
-    @property
-    def miles(self) -> float:
-        return self.end_mile - self.start_mile
 
 
 def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
@@ -252,7 +242,7 @@ def fetch_route(start: Coordinate, finish: Coordinate) -> dict[str, Any]:
     finish_pair = f"{finish.longitude:.6f},{finish.latitude:.6f}"
     params = parse.urlencode(
         {
-            "overview": "simplified",
+            "overview": "full",
             "geometries": "geojson",
             "alternatives": "false",
             "steps": "false",
@@ -396,72 +386,140 @@ def choose_fuel_stops(
     candidates: list[CandidateStation],
     corridor_radius_miles: float,
 ) -> dict[str, Any]:
-    windows = route_windows(distance_miles)
-    candidates_by_window: list[tuple[RouteWindow, list[CandidateStation]]] = []
+    route_gallons = distance_miles / MILES_PER_GALLON
+    required_stop_count = max(0, math.ceil(distance_miles / SAFE_RANGE_MILES) - 1)
+    if required_stop_count == 0:
+        return {
+            "total_fuel_cost_usd": 0.0,
+            "total_route_gallons": round(route_gallons, 2),
+            "total_purchased_gallons": 0.0,
+            "total_detour_cost_usd": 0.0,
+            "selected_fuel_stops": [],
+            "assumptions": fuel_assumptions(),
+        }
 
-    for window in windows:
-        window_candidates = [
-            candidate
-            for candidate in candidates
-            if window.start_mile <= candidate.route_mile <= window.end_mile
-        ]
-        if not window_candidates:
-            raise PlanningError(
-                f"No fuel station found within {corridor_radius_miles:g} miles for route miles "
-                f"{window.start_mile:.0f}-{window.end_mile:.0f}."
-            )
-        candidates_by_window.append((window, window_candidates))
+    stages = candidate_stages(distance_miles, candidates, required_stop_count)
+    path = cheapest_stop_path(distance_miles, stages, corridor_radius_miles)
 
     selected_stops = []
     total_cost = 0.0
     total_detour_cost = 0.0
-    total_gallons = 0.0
+    total_purchased_gallons = 0.0
 
-    for window, window_candidates in candidates_by_window:
-        selected = min(
-            window_candidates,
-            key=lambda candidate: effective_station_cost(window.miles, candidate),
-        )
-        stop = serialize_selected_stop(window, selected)
+    for index, candidate in enumerate(path):
+        next_mile = path[index + 1].route_mile if index + 1 < len(path) else distance_miles
+        stop = serialize_selected_stop(index + 1, candidate, next_mile)
         selected_stops.append(stop)
         total_cost += stop["fuel_cost_usd"] + stop["detour_cost_usd"]
         total_detour_cost += stop["detour_cost_usd"]
-        total_gallons += stop["gallons_needed"]
+        total_purchased_gallons += stop["gallons_needed"]
 
     return {
         "total_fuel_cost_usd": round(total_cost, 2),
-        "total_route_gallons": round(total_gallons, 2),
+        "total_route_gallons": round(route_gallons, 2),
+        "total_purchased_gallons": round(total_purchased_gallons, 2),
         "total_detour_cost_usd": round(total_detour_cost, 2),
         "selected_fuel_stops": selected_stops,
-        "assumptions": {
-            "vehicle_range_miles": MAX_RANGE_MILES,
-            "fuel_efficiency_mpg": MILES_PER_GALLON,
-            "route_window_miles": MAX_RANGE_MILES,
-            "corridor_fallback_miles": list(CORRIDOR_FALLBACK_MILES),
-            "effective_cost_formula": (
-                "route_window_gallons * station_price + "
-                "(distance_from_route_miles * 2 / mpg) * station_price"
-            ),
-        },
+        "assumptions": fuel_assumptions(),
     }
 
 
+def candidate_stages(
+    distance_miles: float,
+    candidates: list[CandidateStation],
+    stop_count: int,
+) -> list[list[CandidateStation]]:
+    stages = []
+    for stage_index in range(1, stop_count + 1):
+        earliest = max(
+            0.0,
+            distance_miles - (stop_count - stage_index + 1) * SAFE_RANGE_MILES,
+        )
+        latest = min(distance_miles, stage_index * SAFE_RANGE_MILES)
+        stage_candidates = [
+            candidate
+            for candidate in candidates
+            if earliest <= candidate.route_mile <= latest
+        ]
+        if not stage_candidates:
+            raise PlanningError(
+                f"No fuel station found for required stop {stage_index} "
+                f"between route miles {earliest:.0f}-{latest:.0f}."
+            )
+        stages.append(stage_candidates)
+    return stages
+
+
+def cheapest_stop_path(
+    distance_miles: float,
+    stages: list[list[CandidateStation]],
+    corridor_radius_miles: float,
+) -> list[CandidateStation]:
+    previous_costs: dict[int, tuple[float, CandidateStation, list[CandidateStation]]] = {}
+    for candidate in stages[0]:
+        if candidate.route_mile <= SAFE_RANGE_MILES:
+            previous_costs[id(candidate)] = (0.0, candidate, [candidate])
+
+    if not previous_costs:
+        raise PlanningError(
+            f"No reachable first fuel stop found within {SAFE_RANGE_MILES:g} miles "
+            f"and {corridor_radius_miles:g} miles of the route."
+        )
+
+    for stage in stages[1:]:
+        current_costs: dict[int, tuple[float, CandidateStation, list[CandidateStation]]] = {}
+        for candidate in stage:
+            best: tuple[float, CandidateStation, list[CandidateStation]] | None = None
+            for previous_cost, previous_candidate, previous_path in previous_costs.values():
+                leg_miles = candidate.route_mile - previous_candidate.route_mile
+                if leg_miles <= 0 or leg_miles > SAFE_RANGE_MILES:
+                    continue
+                cost = previous_cost + fuel_leg_cost(previous_candidate, leg_miles)
+                path = [*previous_path, candidate]
+                if best is None or cost < best[0]:
+                    best = (cost, candidate, path)
+            if best is not None:
+                current_costs[id(candidate)] = best
+        previous_costs = current_costs
+        if not previous_costs:
+            raise PlanningError(
+                "No feasible fuel-stop chain found within the vehicle safety range."
+            )
+
+    best_final: tuple[float, CandidateStation, list[CandidateStation]] | None = None
+    for previous_cost, previous_candidate, previous_path in previous_costs.values():
+        final_leg_miles = distance_miles - previous_candidate.route_mile
+        if final_leg_miles <= 0 or final_leg_miles > SAFE_RANGE_MILES:
+            continue
+        cost = previous_cost + fuel_leg_cost(previous_candidate, final_leg_miles)
+        if best_final is None or cost < best_final[0]:
+            best_final = (cost, previous_candidate, previous_path)
+
+    if best_final is None:
+        raise PlanningError(
+            "No final fuel stop can reach the destination within the vehicle safety range."
+        )
+    return best_final[2]
+
+
 def serialize_selected_stop(
-    window: RouteWindow,
+    sequence: int,
     candidate: CandidateStation,
+    next_route_mile: float,
 ) -> dict[str, Any]:
     station = candidate.station
     price = float(station.retail_price)
-    gallons = window.miles / MILES_PER_GALLON
+    leg_miles = next_route_mile - candidate.route_mile
+    gallons = leg_miles / MILES_PER_GALLON
     fuel_cost = gallons * price
     detour_miles = candidate.distance_from_route_miles * 2.0
     detour_gallons = detour_miles / MILES_PER_GALLON
     detour_cost = detour_gallons * price
     return {
-        "sequence": window.sequence,
-        "window_start_mile": round(window.start_mile, 1),
-        "window_end_mile": round(window.end_mile, 1),
+        "sequence": sequence,
         "route_mile": round(candidate.route_mile, 1),
+        "next_route_mile": round(next_route_mile, 1),
+        "leg_miles_fueled": round(leg_miles, 1),
         "truckstop_id": station.opis_truckstop_id,
         "truckstop_name": station.truckstop_name,
         "address": station.address,
@@ -480,23 +538,29 @@ def serialize_selected_stop(
     }
 
 
-def effective_station_cost(window_miles: float, candidate: CandidateStation) -> float:
+def fuel_leg_cost(candidate: CandidateStation, leg_miles: float) -> float:
     price = float(candidate.station.retail_price)
-    route_fuel_cost = (window_miles / MILES_PER_GALLON) * price
+    route_fuel_cost = (leg_miles / MILES_PER_GALLON) * price
     detour_cost = ((candidate.distance_from_route_miles * 2.0) / MILES_PER_GALLON) * price
     return route_fuel_cost + detour_cost
 
 
-def route_windows(distance_miles: float) -> list[RouteWindow]:
-    windows = []
-    start = 0.0
-    sequence = 1
-    while start < distance_miles:
-        end = min(start + MAX_RANGE_MILES, distance_miles)
-        windows.append(RouteWindow(sequence=sequence, start_mile=start, end_mile=end))
-        start = end
-        sequence += 1
-    return windows
+def fuel_assumptions() -> dict[str, Any]:
+    return {
+        "starts_with_full_tank": True,
+        "vehicle_range_miles": MAX_RANGE_MILES,
+        "safety_range_miles": SAFE_RANGE_MILES,
+        "fuel_efficiency_mpg": MILES_PER_GALLON,
+        "corridor_fallback_miles": list(CORRIDOR_FALLBACK_MILES),
+        "cost_scope": (
+            "Fuel cost is calculated for fuel purchased at selected stops along "
+            "the route. The initial full tank is not counted as an en-route purchase."
+        ),
+        "effective_cost_formula": (
+            "next_leg_gallons * station_price + "
+            "(distance_from_route_miles * 2 / mpg) * station_price"
+        ),
+    }
 
 
 def sample_route(
@@ -629,6 +693,7 @@ def normalize_location(location: str) -> str:
 
 def route_cache_key(start: Coordinate, finish: Coordinate) -> str:
     raw = (
+        "osrm-full-v1:"
         f"{start.latitude:.5f},{start.longitude:.5f}:"
         f"{finish.latitude:.5f},{finish.longitude:.5f}"
     )

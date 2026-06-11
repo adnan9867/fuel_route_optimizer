@@ -9,6 +9,7 @@ from .services import (
     CandidateStation,
     Coordinate,
     choose_fuel_stops,
+    fuel_leg_cost,
     sample_route,
 )
 
@@ -31,25 +32,50 @@ class FuelPlannerTests(SimpleTestCase):
     def test_chooses_effective_cost_not_just_price(self) -> None:
         candidates = [
             self._candidate("cheap_far", 250.0, 3.10, 30.0),
-            self._candidate("slightly_more_near", 260.0, 3.20, 1.0),
+            self._candidate("slightly_more_near", 300.0, 3.20, 1.0),
         ]
 
-        plan = choose_fuel_stops(400.0, candidates, corridor_radius_miles=50.0)
+        plan = choose_fuel_stops(760.0, candidates, corridor_radius_miles=50.0)
 
         self.assertEqual(plan["selected_fuel_stops"][0]["truckstop_name"], "slightly_more_near")
         self.assertGreater(plan["selected_fuel_stops"][0]["detour_cost_usd"], 0)
 
-    def test_divides_route_into_500_mile_windows(self) -> None:
+    def test_short_route_needs_no_fuel_stop_when_starting_full(self) -> None:
+        plan = choose_fuel_stops(400.0, [], corridor_radius_miles=10.0)
+
+        self.assertEqual(plan["selected_fuel_stops"], [])
+        self.assertEqual(plan["total_fuel_cost_usd"], 0.0)
+        self.assertEqual(plan["total_route_gallons"], 40.0)
+        self.assertTrue(plan["assumptions"]["starts_with_full_tank"])
+
+    def test_full_tank_route_uses_one_stop_for_760_miles(self) -> None:
         candidates = [
-            self._candidate("first_window", 250.0, 3.10, 1.0),
-            self._candidate("second_window", 650.0, 3.25, 1.0),
+            self._candidate("too_early", 200.0, 2.50, 1.0),
+            self._candidate("needed_stop", 320.0, 3.25, 1.0),
         ]
 
         plan = choose_fuel_stops(760.0, candidates, corridor_radius_miles=10.0)
 
+        self.assertEqual(len(plan["selected_fuel_stops"]), 1)
+        self.assertEqual(plan["selected_fuel_stops"][0]["truckstop_name"], "needed_stop")
+        self.assertEqual(plan["selected_fuel_stops"][0]["next_route_mile"], 760.0)
+
+    def test_full_tank_route_uses_two_stops_for_1200_miles(self) -> None:
+        candidates = [
+            self._candidate("first_stop", 420.0, 3.10, 1.0),
+            self._candidate("second_stop", 820.0, 3.25, 1.0),
+        ]
+
+        plan = choose_fuel_stops(1200.0, candidates, corridor_radius_miles=10.0)
+
         self.assertEqual(len(plan["selected_fuel_stops"]), 2)
-        self.assertEqual(plan["selected_fuel_stops"][0]["window_end_mile"], 500.0)
-        self.assertEqual(plan["selected_fuel_stops"][1]["window_end_mile"], 760.0)
+        self.assertEqual(plan["selected_fuel_stops"][0]["next_route_mile"], 820.0)
+        self.assertEqual(plan["selected_fuel_stops"][1]["next_route_mile"], 1200.0)
+
+    def test_fuel_leg_cost_includes_detour(self) -> None:
+        candidate = self._candidate("detour", 300.0, 3.00, 5.0)
+
+        self.assertEqual(fuel_leg_cost(candidate, 100.0), 33.0)
 
     def test_route_sampling_keeps_requested_route_distance_scale(self) -> None:
         samples = sample_route(

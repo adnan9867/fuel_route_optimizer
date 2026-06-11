@@ -6,7 +6,7 @@ from common.model_mixins import TimestampMixin
 
 
 class FuelStation(TimestampMixin):
-    opis_truckstop_id = models.CharField(max_length=32, db_index=True)
+    opis_truckstop_id = models.CharField(max_length=32, unique=True)
     truckstop_name = models.CharField(max_length=255)
     address = models.CharField(max_length=255, blank=True)
     city = models.CharField(max_length=120, db_index=True)

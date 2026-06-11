@@ -28,10 +28,10 @@ class Command(BaseCommand):
         parser.add_argument(
             "--provider",
             choices=["city-centroid", "nominatim"],
-            default="city-centroid",
+            default="nominatim",
             help=(
-                "city-centroid is fast and deterministic for the assignment dataset; "
-                "nominatim geocodes full station addresses but is rate-limited."
+                "nominatim geocodes full station addresses for accurate route matching; "
+                "city-centroid is a fast deterministic fallback for local demos."
             ),
         )
         parser.add_argument(
