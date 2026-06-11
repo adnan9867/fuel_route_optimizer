@@ -31,8 +31,3 @@ class RoutePlanCreateAPIView(BaseAPIView, CreateAPIView):
             message="Route plan created successfully",
             data=result,
         )
-
-
-class HealthAPIView(BaseAPIView):
-    def get(self, request: Request):
-        return self.send_success_response(data={"status": "ok"})

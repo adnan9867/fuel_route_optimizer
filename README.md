@@ -32,8 +32,7 @@ Content-Type: application/json
 }
 ```
 
-The route endpoint is implemented with DRF `CreateAPIView`. A lightweight
-health endpoint is also available at `GET /api/health/`.
+The route endpoint is implemented with DRF `CreateAPIView`.
 
 ## How It Works
 
