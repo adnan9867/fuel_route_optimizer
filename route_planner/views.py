@@ -28,17 +28,22 @@ def health_view(request: HttpRequest) -> JsonResponse:
 
 def _request_payload(request: HttpRequest) -> dict[str, str]:
     if request.method == "GET":
-        start = request.GET.get("start", "")
-        finish = request.GET.get("finish", "") or request.GET.get("end", "")
+        start = request.GET.get("start_location", "") or request.GET.get("start", "")
+        finish = (
+            request.GET.get("finish_location", "")
+            or request.GET.get("finish", "")
+            or request.GET.get("end", "")
+        )
     else:
         try:
             raw_payload = json.loads(request.body.decode("utf-8") or "{}")
         except json.JSONDecodeError as exc:
             raise BadRequest("Request body must be valid JSON.") from exc
 
-        start = raw_payload.get("start", "")
+        start = raw_payload.get("start_location", "") or raw_payload.get("start", "")
         finish = (
-            raw_payload.get("finish", "")
+            raw_payload.get("finish_location", "")
+            or raw_payload.get("finish", "")
             or raw_payload.get("end", "")
             or raw_payload.get("destination", "")
         )
@@ -46,7 +51,6 @@ def _request_payload(request: HttpRequest) -> dict[str, str]:
     start = " ".join(str(start or "").split())
     finish = " ".join(str(finish or "").split())
     if not start or not finish:
-        raise BadRequest("Both start and finish locations are required.")
+        raise BadRequest("Both start_location and finish_location are required.")
 
     return {"start": start, "finish": finish}
-

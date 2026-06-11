@@ -1,44 +1,76 @@
 # Route Detection API
 
-Django API for the backend route/fuel assessment. It accepts a start and finish
-location in the USA, fetches one driving route from OSRM, finds fuel stations
-near the route from the provided CSV, and returns a GeoJSON map plus an
-optimized fuel plan.
+Django REST-style API for the backend assessment. The API accepts two USA
+location names, calculates a driving route, selects cost-effective fuel stops
+from the provided CSV data, and returns route geometry plus fuel cost details.
 
-## Run
+## Setup
 
 ```bash
+./venv/bin/python manage.py migrate
+./venv/bin/python manage.py import_fuel_stations --replace
+./venv/bin/python manage.py geocode_fuel_stations
 ./venv/bin/python manage.py runserver
 ```
 
-## Request
+The CSV file is not edited. It is imported once into the `FuelStation` table.
+Latitude and longitude are stored in the database after the one-time station
+geocoding step.
 
-```bash
-curl -X POST http://127.0.0.1:8000/api/routes/ \
-  -H "Content-Type: application/json" \
-  -d '{"start":"New York, NY","finish":"Chicago, IL"}'
+## API
+
+```http
+POST /api/routes/
+Content-Type: application/json
+
+{
+  "start_location": "New York, NY",
+  "finish_location": "Chicago, IL"
+}
 ```
 
-`GET /api/routes/?start=New%20York,%20NY&finish=Chicago,%20IL` is also
-supported for quick demos.
+`GET /api/routes/?start_location=New%20York,%20NY&finish_location=Chicago,%20IL`
+is also supported for quick browser/Postman demos.
 
-## Response Highlights
+## How It Works
 
-- `route.geometry`: GeoJSON `LineString` suitable for rendering on a map.
-- `map`: GeoJSON `FeatureCollection` with route, start, finish, and fuel-stop
-  markers.
-- `fuel.stops`: selected fuel stops from `fuel-prices-for-be-assessment.csv`.
-- `fuel.purchases`: gallons and cost for each fuel leg.
-- `fuel.total_cost_usd`: total fuel spend at 10 MPG.
+1. `FuelStation` rows are imported from `fuel-prices-for-be-assessment.csv`.
+2. Station coordinates are geocoded once and saved in the database.
+3. Start and finish locations are geocoded with Nominatim.
+4. Start/finish geocoding results are saved in `GeocodeCache`.
+5. OSRM calculates the route from the cached coordinates.
+6. OSRM route geometry, distance, and duration are saved in `RouteCache`.
+7. The route is sampled and matched against geocoded CSV fuel stations.
+8. The service searches a route corridor using fallback radii: 10, 25, 50 miles.
+9. The route is divided into 500-mile windows.
+10. Each window selects the station with the lowest effective cost:
 
-## Providers
+```text
+effective cost =
+  route window gallons * station price
+  + (distance from route * 2 / 10 MPG) * station price
+```
 
-- Geocoding: OpenStreetMap Nominatim, two calls per uncached request.
-- Routing: OSRM public demo server, one call per uncached request.
-- Fuel prices: the provided CSV.
-- Station coordinates: local GeoNames city/state centroids generated once and
-  stored in `route_planner/data/us_city_centroids.csv`, so station geocoding is
-  not performed during API requests.
+## Response Includes
+
+- start and finish coordinates
+- total route distance
+- estimated route duration
+- GeoJSON route geometry
+- selected fuel stops
+- price per gallon
+- gallons needed per 500-mile window
+- fuel cost per stop
+- estimated detour cost
+- total fuel cost
+
+## External APIs
+
+- Nominatim/OpenStreetMap: start and finish geocoding, cached in DB
+- OSRM: routing, cached in DB
+
+The API does not read the CSV on each request and does not geocode fuel stations
+during route requests.
 
 ## Tests
 

@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+db.sqlite3
+route_detection_data_tmp/
+venv/
+.env
