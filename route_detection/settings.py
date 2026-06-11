@@ -32,6 +32,7 @@ ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'testserver']
 
 INSTALLED_APPS = [
     'route_planner',
+    'rest_framework',
     'django.contrib.staticfiles',
 ]
 
@@ -97,3 +98,9 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 ROUTE_PLANNER_GEOCODE_CACHE_TTL = 60 * 60 * 24 * 30
 ROUTE_PLANNER_ROUTE_CACHE_TTL = 60 * 60 * 24
 ROUTE_PLANNER_USER_AGENT = 'route-detection-assessment/1.0 (Django backend assessment)'
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [],
+    'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny'],
+    'UNAUTHENTICATED_USER': None,
+}

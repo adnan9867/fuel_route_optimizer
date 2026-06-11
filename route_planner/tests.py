@@ -87,4 +87,5 @@ class RoutePlanViewTests(SimpleTestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("error", response.json())
+        self.assertIn("start_location", response.json())
+        self.assertIn("finish_location", response.json())

@@ -29,8 +29,13 @@ Content-Type: application/json
 }
 ```
 
-`GET /api/routes/?start_location=New%20York,%20NY&finish_location=Chicago,%20IL`
-is also supported for quick browser/Postman demos.
+The route endpoint is implemented with DRF `CreateAPIView`.
+
+Fuel stations can be inspected with the DRF `ListAPIView` endpoint:
+
+```http
+GET /api/fuel-stations/?state=OH&geocoded=true
+```
 
 ## How It Works
 
