@@ -132,11 +132,11 @@ class FuelPlannerTests(SimpleTestCase):
 
 
 class RoutePlanViewTests(SimpleTestCase):
-    def test_short_route_does_not_load_fuel_station_catalog(self) -> None:
+    def test_short_route_response_is_assignment_focused(self) -> None:
         with (
             patch(
-                "route_planner.services.geocode_location",
-                side_effect=[Coordinate(40.0, -75.0), Coordinate(41.0, -74.0)],
+                "route_planner.services.geocode_route_endpoints",
+                return_value=(Coordinate(40.0, -75.0), Coordinate(41.0, -74.0)),
             ),
             patch(
                 "route_planner.services.fetch_route",
@@ -156,9 +156,16 @@ class RoutePlanViewTests(SimpleTestCase):
         ):
             result = plan_route("Start, PA", "Finish, NY")
 
-        self.assertEqual(result["fuel_plan"]["selected_fuel_stops"], [])
+        self.assertEqual(result["fuel_plan"]["fuel_stops"], [])
         self.assertEqual(result["fuel_plan"]["total_route_gallons"], 12.0)
-        self.assertIsNone(result["station_search"]["database_station_count"])
+        self.assertEqual(result["fuel_plan"]["vehicle_range_miles"], 500.0)
+        self.assertEqual(result["fuel_plan"]["fuel_efficiency_mpg"], 10.0)
+        self.assertTrue(result["fuel_plan"]["starts_with_full_tank"])
+        self.assertNotIn("station_search", result)
+        self.assertNotIn("providers", result)
+        self.assertNotIn("elapsed_ms", result)
+        self.assertNotIn("map", result)
+        self.assertNotIn("bounds", result["route"])
 
     def test_missing_locations_returns_400(self) -> None:
         response = self.client.post(
@@ -206,7 +213,308 @@ class ImportFuelStationsCommandTests(TestCase):
             any("Skipped 1 already geocoded stations." in line for line in stdout.lines)
         )
 
-    def test_skips_station_after_nominatim_no_result(self) -> None:
+    @override_settings(GEOCODIO_API_KEYS=[])
+    def test_uses_fallback_query_after_nominatim_no_result(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="fallback-1",
+            truckstop_name="Pilot Travel Center 123",
+            address="Unknown Exit",
+            city="Somewhere",
+            state="PA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+        )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    [],
+                    [{"lat": "40.12345678", "lon": "-75.12345678"}],
+                ],
+            ) as get_json,
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 1)
+        self.assertEqual(station.latitude, Decimal("40.1234568"))
+        self.assertEqual(station.longitude, Decimal("-75.1234568"))
+        self.assertEqual(station.geocode_source, NOMINATIM_FALLBACK_SOURCE)
+        self.assertEqual(get_json.call_count, 2)
+
+    @override_settings(GEOCODIO_API_KEYS=[])
+    def test_retries_legacy_nominatim_no_result_with_fallback(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="legacy-missing-1",
+            truckstop_name="Pilot Travel Center 456",
+            address="Unknown Exit",
+            city="Somewhere",
+            state="PA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+            geocode_source=NOMINATIM_NO_RESULT_SOURCE,
+        )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    [],
+                    [{"lat": "40.12345678", "lon": "-75.12345678"}],
+                ],
+            ),
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 1)
+        self.assertEqual(station.geocode_source, NOMINATIM_FALLBACK_SOURCE)
+
+    @override_settings(GEOCODIO_API_KEYS=["key-a", "key-b"])
+    def test_uses_geocodio_before_nominatim(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="geocodio-1",
+            truckstop_name="Precise Station",
+            address="1109 N Highland St",
+            city="Arlington",
+            state="VA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+        )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    {
+                        "results": [
+                            {
+                                "accuracy": 1,
+                                "accuracy_type": "rooftop",
+                                "location": {
+                                    "lat": 38.886665,
+                                    "lng": -77.094733,
+                                },
+                            },
+                        ],
+                    },
+                ],
+            ) as get_json,
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 1)
+        self.assertEqual(station.latitude, Decimal("38.8866650"))
+        self.assertEqual(station.longitude, Decimal("-77.0947330"))
+        self.assertEqual(station.geocode_source, GEOCODIO_SOURCE)
+        self.assertEqual(get_json.call_count, 1)
+        self.assertIn("api.geocod.io/v2/geocode", get_json.call_args_list[0].args[0])
+
+    @override_settings(GEOCODIO_API_KEYS=["key-a"])
+    def test_accepts_highway_exit_geocodio_street_center_result(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="geocodio-highway-exit",
+            truckstop_name="TA BINGHAMTON TRAVELCENTER",
+            address="I-81N, EXIT 2W & I-81S, EXIT 3",
+            city="Binghamton",
+            state="NY",
+            rack_id="32",
+            retail_price=Decimal("3.6890"),
+        )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    {
+                        "results": [
+                            {
+                                "accuracy": 0.78,
+                                "accuracy_type": "street_center",
+                                "location": {
+                                    "lat": 42.102705,
+                                    "lng": -75.827683,
+                                },
+                            },
+                        ],
+                    },
+                ],
+            ),
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 1)
+        self.assertEqual(station.latitude, Decimal("42.1027050"))
+        self.assertEqual(station.longitude, Decimal("-75.8276830"))
+        self.assertEqual(station.geocode_source, GEOCODIO_SOURCE)
+
+    @override_settings(GEOCODIO_API_KEYS=["key-a"])
+    def test_rejects_near_threshold_street_center_for_non_exit_address(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="geocodio-street-center-low",
+            truckstop_name="Low Accuracy Station",
+            address="Unknown Road",
+            city="Binghamton",
+            state="NY",
+            rack_id="32",
+            retail_price=Decimal("3.6890"),
+        )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    {
+                        "results": [
+                            {
+                                "accuracy": 0.78,
+                                "accuracy_type": "street_center",
+                                "location": {
+                                    "lat": 42.102705,
+                                    "lng": -75.827683,
+                                },
+                            },
+                        ],
+                    },
+                    [],
+                    [],
+                ],
+            ),
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 0)
+        self.assertIsNone(station.latitude)
+        self.assertIsNone(station.longitude)
+        self.assertEqual(station.geocode_source, NOMINATIM_FALLBACK_NO_RESULT_SOURCE)
+
+    @override_settings(GEOCODIO_API_KEYS=["key-a", "key-b"])
+    def test_tries_second_geocodio_key_when_first_key_fails(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="geocodio-2",
+            truckstop_name="Precise Station",
+            address="1109 N Highland St",
+            city="Arlington",
+            state="VA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+        )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    UpstreamServiceError("first key is over quota"),
+                    {
+                        "results": [
+                            {
+                                "accuracy": 1,
+                                "accuracy_type": "rooftop",
+                                "location": {
+                                    "lat": 38.886665,
+                                    "lng": -77.094733,
+                                },
+                            },
+                        ],
+                    },
+                ],
+            ) as get_json,
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 1)
+        self.assertEqual(station.geocode_source, GEOCODIO_SOURCE)
+        self.assertEqual(get_json.call_count, 2)
+
+    @override_settings(GEOCODIO_API_KEYS=["key-a"])
+    def test_rejects_low_accuracy_geocodio_result(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="geocodio-low-accuracy",
+            truckstop_name="Imprecise Station",
+            address="Unknown Exit",
+            city="Nowhere",
+            state="PA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+        )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    {
+                        "results": [
+                            {
+                                "accuracy": 0.5,
+                                "accuracy_type": "place",
+                                "location": {
+                                    "lat": 40.0,
+                                    "lng": -75.0,
+                                },
+                            },
+                        ],
+                    },
+                    [],
+                    [],
+                ],
+            ),
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 0)
+        self.assertIsNone(station.latitude)
+        self.assertIsNone(station.longitude)
+        self.assertEqual(station.geocode_source, NOMINATIM_FALLBACK_NO_RESULT_SOURCE)
+
+    def test_skips_station_after_all_geocoding_queries_have_no_result(self) -> None:
         station = FuelStation.objects.create(
             opis_truckstop_id="missing-1",
             truckstop_name="Missing Station",
@@ -218,10 +526,13 @@ class ImportFuelStationsCommandTests(TestCase):
         )
         stdout = CaptureStdout()
 
-        with patch(
-            "route_planner.management.commands.import_fuel_stations._get_json",
-            return_value=[],
-        ) as get_json:
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                return_value=[],
+            ) as get_json,
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
             geocoded = geocode_missing_stations(
                 stdout=stdout,
                 success_style=str,
@@ -230,12 +541,15 @@ class ImportFuelStationsCommandTests(TestCase):
 
         station.refresh_from_db()
         self.assertEqual(geocoded, 0)
-        self.assertEqual(station.geocode_source, NOMINATIM_NO_RESULT_SOURCE)
-        self.assertEqual(get_json.call_count, 1)
+        self.assertEqual(station.geocode_source, NOMINATIM_FALLBACK_NO_RESULT_SOURCE)
+        self.assertEqual(get_json.call_count, 3)
 
-        with patch(
-            "route_planner.management.commands.import_fuel_stations._get_json",
-            side_effect=AssertionError("processed rows should be skipped"),
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                return_value=[],
+            ) as second_get_json,
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
         ):
             geocoded = geocode_missing_stations(
                 stdout=stdout,
@@ -244,9 +558,43 @@ class ImportFuelStationsCommandTests(TestCase):
             )
 
         self.assertEqual(geocoded, 0)
-        self.assertTrue(
-            any("Skipped 1 previously processed stations." in line for line in stdout.lines)
+        self.assertEqual(second_get_json.call_count, 3)
+
+    @override_settings(GEOCODIO_API_KEYS=[])
+    def test_reprocesses_fallback_no_result_station_by_default(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="retry-missing-1",
+            truckstop_name="Retry Station",
+            address="1109 N Highland St",
+            city="Arlington",
+            state="VA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+            geocode_source=NOMINATIM_FALLBACK_NO_RESULT_SOURCE,
         )
+        stdout = CaptureStdout()
+
+        with (
+            patch(
+                "route_planner.management.commands.import_fuel_stations._get_json",
+                side_effect=[
+                    [{"lat": "38.886665", "lon": "-77.094733"}],
+                ],
+            ) as get_json,
+            patch("route_planner.management.commands.import_fuel_stations.time.sleep"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 1)
+        self.assertEqual(station.latitude, Decimal("38.8866650"))
+        self.assertEqual(station.longitude, Decimal("-77.0947330"))
+        self.assertEqual(station.geocode_source, "nominatim")
+        self.assertEqual(get_json.call_count, 1)
 
 
 class CaptureStdout:

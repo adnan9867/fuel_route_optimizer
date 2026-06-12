@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -108,6 +109,24 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 ROUTE_PLANNER_GEOCODE_CACHE_TTL = 60 * 60 * 24 * 30
 ROUTE_PLANNER_ROUTE_CACHE_TTL = 60 * 60 * 24
 ROUTE_PLANNER_USER_AGENT = 'route-detection-assessment/1.0 (Django backend assessment)'
+ROUTE_PLANNER_LOCATION_GEOCODE_TIMEOUT_SECONDS = 4
+ROUTE_PLANNER_ROUTE_TIMEOUT_SECONDS = 12
+ROUTE_PLANNER_STATION_GEOCODE_TIMEOUT_SECONDS = 6
+_GEOCODIO_API_KEYS = os.environ.get(
+    'GEOCODIO_API_KEYS',
+    os.environ.get(
+        'GEOCODIO_API_KEY',
+        (
+            '3bae2cfa8f3eae96efa9abc96b26be2c7b63aeb,'
+            '46e0667b5b0b69b0b2b9bb22441bb9e11abeaba'
+        ),
+    ),
+)
+GEOCODIO_API_KEYS = [
+    key.strip()
+    for key in _GEOCODIO_API_KEYS.split(',')
+    if key.strip()
+]
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [],

@@ -14,15 +14,17 @@ from route_planner.models import FuelStation
 from route_planner.services import _get_json
 
 
-NOMINATIM_SLEEP_SECONDS = 1.0
-GEOCODE_PROGRESS_INTERVAL = 25
+PRICE_PRECISION = Decimal("0.0001")
+COORDINATE_PRECISION = Decimal("0.0000001")
+NOMINATIM_DELAY_SECONDS = 1.0
+PROGRESS_INTERVAL = 25
 NOMINATIM_SOURCE = "nominatim"
 NOMINATIM_NO_RESULT_SOURCE = "nominatim-no-result"
 PROCESSED_GEOCODE_SOURCES = (NOMINATIM_SOURCE, NOMINATIM_NO_RESULT_SOURCE)
 
 
 class Command(BaseCommand):
-    help = "Import the provided fuel price CSV into the FuelStation table."
+    help = "Import the assessment fuel price CSV and geocode new fuel stations."
 
     def add_arguments(self, parser) -> None:
         parser.add_argument(
@@ -45,46 +47,11 @@ class Command(BaseCommand):
             deleted, _ = FuelStation.objects.all().delete()
             self.stdout.write(f"Deleted {deleted} existing fuel station rows.")
 
-        stations_by_id: dict[str, dict[str, str | Decimal]] = {}
-        skipped = 0
-        with csv_path.open(newline="", encoding="utf-8") as handle:
-            for row_number, row in enumerate(csv.DictReader(handle), start=1):
-                try:
-                    price = Decimal(clean(row["Retail Price"])).quantize(Decimal("0.0001"))
-                except (KeyError, InvalidOperation):
-                    skipped += 1
-                    continue
-
-                truckstop_id = clean(row.get("OPIS Truckstop ID")) or f"row-{row_number}"
-                record = {
-                    "truckstop_name": clean(row.get("Truckstop Name")) or "Unknown Truckstop",
-                    "address": clean(row.get("Address")),
-                    "city": clean(row.get("City")),
-                    "state": clean(row.get("State")).upper(),
-                    "rack_id": clean(row.get("Rack ID")),
-                    "retail_price": price,
-                    "is_active": True,
-                }
-                existing = stations_by_id.get(truckstop_id)
-                if existing is None or price < existing["retail_price"]:
-                    stations_by_id[truckstop_id] = record
-
-        created = 0
-        updated = 0
-        for truckstop_id, defaults in stations_by_id.items():
-            _, was_created = FuelStation.objects.update_or_create(
-                opis_truckstop_id=truckstop_id,
-                defaults=defaults,
-            )
-            if was_created:
-                created += 1
-            else:
-                updated += 1
-
+        created, updated, skipped = import_fuel_station_csv(csv_path)
         self.stdout.write(
             self.style.SUCCESS(
-                f"Imported {created} and updated {updated} fuel stations from "
-                f"{csv_path.name}; skipped {skipped} rows."
+                f"Imported {created} new and updated {updated} fuel stations "
+                f"from {csv_path.name}; skipped {skipped} invalid rows."
             )
         )
 
@@ -94,14 +61,63 @@ class Command(BaseCommand):
             warning_style=self.style.WARNING,
         )
         self.stdout.write(
-            self.style.SUCCESS(
-                f"Geocoded {geocoded} fuel stations with Nominatim."
-            )
+            self.style.SUCCESS(f"Geocoded {geocoded} fuel stations with Nominatim.")
         )
 
 
-def clean(value: object) -> str:
-    return " ".join(str(value or "").strip().split())
+def import_fuel_station_csv(csv_path: Path) -> tuple[int, int, int]:
+    rows, skipped = read_station_rows(csv_path)
+
+    created = 0
+    updated = 0
+    for truckstop_id, defaults in rows.items():
+        _, was_created = FuelStation.objects.update_or_create(
+            opis_truckstop_id=truckstop_id,
+            defaults=defaults,
+        )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    return created, updated, skipped
+
+
+def read_station_rows(csv_path: Path) -> tuple[dict[str, dict[str, str | Decimal | bool]], int]:
+    rows: dict[str, dict[str, str | Decimal | bool]] = {}
+    skipped = 0
+
+    with csv_path.open(newline="", encoding="utf-8") as file_obj:
+        for row_number, raw_row in enumerate(csv.DictReader(file_obj), start=1):
+            try:
+                truckstop_id, row = station_row_from_csv(raw_row, row_number)
+            except (KeyError, InvalidOperation):
+                skipped += 1
+                continue
+
+            current = rows.get(truckstop_id)
+            if current is None or row["retail_price"] < current["retail_price"]:
+                rows[truckstop_id] = row
+
+    return rows, skipped
+
+
+def station_row_from_csv(
+    row: dict[str, str],
+    row_number: int,
+) -> tuple[str, dict[str, str | Decimal | bool]]:
+    truckstop_id = clean(row.get("OPIS Truckstop ID")) or f"row-{row_number}"
+    price = Decimal(clean(row["Retail Price"])).quantize(PRICE_PRECISION)
+
+    return truckstop_id, {
+        "truckstop_name": clean(row.get("Truckstop Name")) or "Unknown Truckstop",
+        "address": clean(row.get("Address")),
+        "city": clean(row.get("City")),
+        "state": clean(row.get("State")).upper(),
+        "rack_id": clean(row.get("Rack ID")),
+        "retail_price": price,
+        "is_active": True,
+    }
 
 
 def geocode_missing_stations(stdout, success_style, warning_style) -> int:
@@ -113,91 +129,125 @@ def geocode_missing_stations(stdout, success_style, warning_style) -> int:
     if already_geocoded:
         stdout.write(success_style(f"Skipped {already_geocoded} already geocoded stations."))
 
-    missing_queryset = FuelStation.objects.filter(
+    missing = FuelStation.objects.filter(
         is_active=True,
         latitude__isnull=True,
         longitude__isnull=True,
     )
-    queryset = missing_queryset.exclude(
-        geocode_source__in=PROCESSED_GEOCODE_SOURCES,
-    ).order_by("id")
-    skipped_previously_processed = missing_queryset.count() - queryset.count()
-    total = queryset.count()
-    if skipped_previously_processed:
-        stdout.write(
-            success_style(
-                f"Skipped {skipped_previously_processed} previously processed stations."
-            )
-        )
+    pending = missing.exclude(geocode_source__in=PROCESSED_GEOCODE_SOURCES).order_by("id")
+
+    skipped_processed = missing.count() - pending.count()
+    if skipped_processed:
+        stdout.write(success_style(f"Skipped {skipped_processed} previously processed stations."))
+
+    total = pending.count()
     if total == 0:
         stdout.write(success_style("No fuel stations are missing coordinates."))
         return 0
 
-    updated = 0
-    no_result = 0
     stdout.write(
         f"Geocoding {total} fuel stations with Nominatim "
-        f"(sleep={NOMINATIM_SLEEP_SECONDS}s between requests)."
+        f"(delay={NOMINATIM_DELAY_SECONDS:g}s)."
     )
-    for index, station in enumerate(queryset.iterator(chunk_size=100), start=1):
-        payload = _get_json(nominatim_url(station), timeout=15)
-        if payload:
-            station.latitude = Decimal(payload[0]["lat"]).quantize(Decimal("0.0000001"))
-            station.longitude = Decimal(payload[0]["lon"]).quantize(Decimal("0.0000001"))
-            station.geocode_source = NOMINATIM_SOURCE
-            station.geocoded_at = timezone.now()
-            station.save(
-                update_fields=[
-                    "latitude",
-                    "longitude",
-                    "geocode_source",
-                    "geocoded_at",
-                    "updated_at",
-                ]
-            )
-            updated += 1
-            status = "geocoded"
-        else:
-            station.geocode_source = NOMINATIM_NO_RESULT_SOURCE
-            station.geocoded_at = timezone.now()
-            station.save(
-                update_fields=[
-                    "geocode_source",
-                    "geocoded_at",
-                    "updated_at",
-                ]
-            )
-            no_result += 1
-            status = "no result"
 
-        if index == 1 or index == total or index % GEOCODE_PROGRESS_INTERVAL == 0:
+    geocoded = 0
+    missing_result = 0
+    for index, station in enumerate(pending.iterator(chunk_size=100), start=1):
+        location = geocode_station(station)
+        if location is None:
+            mark_without_coordinates(station)
+            missing_result += 1
+            status = "no result"
+        else:
+            save_coordinates(station, location)
+            geocoded += 1
+            status = "geocoded"
+
+        if should_report_progress(index, total):
             stdout.write(
                 f"[{index}/{total}] {status}: "
                 f"{station.truckstop_name} ({station.city}, {station.state})"
             )
-        time.sleep(NOMINATIM_SLEEP_SECONDS)
 
-    if no_result:
+        if index < total:
+            time.sleep(NOMINATIM_DELAY_SECONDS)
+
+    if missing_result:
         stdout.write(
             warning_style(
-                f"Nominatim returned no result for {no_result} fuel stations. "
-                "They are marked and will be skipped on the next import."
+                f"Nominatim returned no result for {missing_result} fuel stations. "
+                "They were marked and will be skipped on the next import."
             )
         )
-    return updated
+
+    return geocoded
 
 
-def nominatim_url(station: FuelStation) -> str:
-    query = ", ".join(
-        part
-        for part in [
-            station.address,
-            station.city,
-            station.state,
-            "USA",
+def geocode_station(station: FuelStation) -> dict[str, object] | None:
+    queries = station_geocode_queries(station)
+    for index, query in enumerate(queries):
+        if index:
+            time.sleep(NOMINATIM_DELAY_SECONDS)
+
+        payload = _get_json(nominatim_url(query), timeout=station_geocode_timeout())
+        if payload:
+            return payload[0]
+
+    return None
+
+
+def station_geocode_queries(station: FuelStation) -> list[str]:
+    queries = [
+        geocode_query(station.address, station.city, station.state, "USA"),
+        geocode_query(station.truckstop_name, station.city, station.state, "USA"),
+    ]
+
+    unique_queries = []
+    seen = set()
+    for query in queries:
+        key = query.casefold()
+        if query and key not in seen:
+            unique_queries.append(query)
+            seen.add(key)
+
+    return unique_queries
+
+
+def save_coordinates(station: FuelStation, payload: dict[str, object]) -> None:
+    station.latitude = Decimal(str(payload["lat"])).quantize(COORDINATE_PRECISION)
+    station.longitude = Decimal(str(payload["lon"])).quantize(COORDINATE_PRECISION)
+    station.geocode_source = NOMINATIM_SOURCE
+    station.geocoded_at = timezone.now()
+    station.save(
+        update_fields=[
+            "latitude",
+            "longitude",
+            "geocode_source",
+            "geocoded_at",
+            "updated_at",
         ]
-        if part
     )
+
+
+def mark_without_coordinates(station: FuelStation) -> None:
+    station.geocode_source = NOMINATIM_NO_RESULT_SOURCE
+    station.geocoded_at = timezone.now()
+    station.save(update_fields=["geocode_source", "geocoded_at", "updated_at"])
+
+
+def should_report_progress(index: int, total: int) -> bool:
+    return index == 1 or index == total or index % PROGRESS_INTERVAL == 0
+
+
+def station_geocode_timeout() -> float:
+    return getattr(settings, "ROUTE_PLANNER_STATION_GEOCODE_TIMEOUT_SECONDS", 6)
+
+
+def geocode_query(*parts: object) -> str:
+    return ", ".join(part for part in (clean(part) for part in parts) if part)
+
+
+def nominatim_url(query: str) -> str:
     params = parse.urlencode(
         {
             "q": query,
@@ -207,3 +257,7 @@ def nominatim_url(station: FuelStation) -> str:
         }
     )
     return f"https://nominatim.openstreetmap.org/search?{params}"
+
+
+def clean(value: object) -> str:
+    return " ".join(str(value or "").strip().split())

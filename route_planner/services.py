@@ -3,14 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 from urllib import error, parse, request
 
 from django.conf import settings
-from django.db import transaction
+from django.db import close_old_connections, transaction
 
 from .models import FuelStation, GeocodeCache, RouteCache
 
@@ -117,15 +117,13 @@ class CandidateStation:
 
 
 def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
-    started_at = time.perf_counter()
-    start = geocode_location(start_text)
-    finish = geocode_location(finish_text)
+    normalize_location(start_text)
+    normalize_location(finish_text)
+    start, finish = geocode_route_endpoints(start_text, finish_text)
     route = fetch_route(start, finish)
 
     distance_miles = route["distance_miles"]
     candidates: list[CandidateStation] = []
-    selected_radius = None
-    database_station_count = None
 
     if distance_miles <= SAFE_RANGE_MILES:
         fuel_plan = choose_fuel_stops(
@@ -136,7 +134,6 @@ def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
     else:
         samples = sample_route(route["coordinates"], distance_miles)
         station_index = StationIndex.from_database()
-        database_station_count = station_index.station_count
         fuel_plan = None
 
         for radius in CORRIDOR_FALLBACK_MILES:
@@ -145,10 +142,9 @@ def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
                 fuel_plan = choose_fuel_stops(distance_miles, candidates, radius)
             except PlanningError:
                 continue
-            selected_radius = radius
             break
 
-        if fuel_plan is None or selected_radius is None:
+        if fuel_plan is None:
             raise PlanningError("No fuel station from provided CSV found near this route.")
 
     route_coordinates = [point.as_geojson_position() for point in route["coordinates"]]
@@ -170,27 +166,56 @@ def plan_route(start_text: str, finish_text: str) -> dict[str, Any]:
                 "type": "LineString",
                 "coordinates": route_coordinates,
             },
-            "bounds": route_bounds(route["coordinates"]),
         },
-        "fuel_plan": fuel_plan,
-        "station_search": {
-            "corridor_radius_miles": selected_radius,
-            "candidate_count": len(candidates),
-            "database_station_count": database_station_count,
-        },
-        "map": build_feature_collection(
-            route_coordinates=route_coordinates,
-            start=start,
-            finish=finish,
-            stops=fuel_plan["selected_fuel_stops"],
-        ),
-        "providers": {
-            "geocoding": "OpenStreetMap Nominatim, cached in GeocodeCache",
-            "routing": "OSRM public demo server, cached in RouteCache",
-            "fuel_prices": "FuelStation table imported from fuel-prices-for-be-assessment.csv",
-        },
-        "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
+        "fuel_plan": format_fuel_plan(fuel_plan),
     }
+
+
+def format_fuel_plan(fuel_plan: dict[str, Any]) -> dict[str, Any]:
+    assumptions = fuel_plan.get("assumptions", {})
+    return {
+        "vehicle_range_miles": assumptions.get("vehicle_range_miles", MAX_RANGE_MILES),
+        "fuel_efficiency_mpg": assumptions.get("fuel_efficiency_mpg", MILES_PER_GALLON),
+        "starts_with_full_tank": assumptions.get("starts_with_full_tank", True),
+        "total_route_gallons": fuel_plan["total_route_gallons"],
+        "total_fuel_cost_usd": fuel_plan["total_fuel_cost_usd"],
+        "fuel_stops": [
+            format_fuel_stop(stop) for stop in fuel_plan["selected_fuel_stops"]
+        ],
+    }
+
+
+def format_fuel_stop(stop: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sequence": stop["sequence"],
+        "route_mile": stop["route_mile"],
+        "next_route_mile": stop["next_route_mile"],
+        "truckstop_name": stop["truckstop_name"],
+        "address": stop["address"],
+        "city": stop["city"],
+        "state": stop["state"],
+        "latitude": stop["latitude"],
+        "longitude": stop["longitude"],
+        "price_per_gallon_usd": stop["price_per_gallon_usd"],
+        "gallons_needed": stop["gallons_needed"],
+        "fuel_cost_usd": stop["fuel_cost_usd"],
+        "distance_from_route_miles": stop["distance_from_route_miles"],
+    }
+
+
+def geocode_route_endpoints(start_text: str, finish_text: str) -> tuple[Coordinate, Coordinate]:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        start_future = executor.submit(geocode_location_in_thread, start_text)
+        finish_future = executor.submit(geocode_location_in_thread, finish_text)
+        return start_future.result(), finish_future.result()
+
+
+def geocode_location_in_thread(location: str) -> Coordinate:
+    close_old_connections()
+    try:
+        return geocode_location(location)
+    finally:
+        close_old_connections()
 
 
 def geocode_location(location: str) -> Coordinate:
@@ -210,7 +235,7 @@ def geocode_location(location: str) -> Coordinate:
     )
     payload = _get_json(
         f"https://nominatim.openstreetmap.org/search?{params}",
-        timeout=10,
+        timeout=getattr(settings, "ROUTE_PLANNER_LOCATION_GEOCODE_TIMEOUT_SECONDS", 4),
     )
     if not payload:
         raise BadRequest(f"Could not geocode a USA location for: {query}")
@@ -261,7 +286,10 @@ def fetch_route(start: Coordinate, finish: Coordinate) -> dict[str, Any]:
         }
     )
     url = f"https://router.project-osrm.org/route/v1/driving/{start_pair};{finish_pair}?{params}"
-    payload = _get_json(url, timeout=25)
+    payload = _get_json(
+        url,
+        timeout=getattr(settings, "ROUTE_PLANNER_ROUTE_TIMEOUT_SECONDS", 12),
+    )
     if payload.get("code") != "Ok" or not payload.get("routes"):
         raise UpstreamServiceError("Routing service could not calculate that route.")
 
@@ -669,62 +697,6 @@ def haversine_miles(a: Coordinate, b: Coordinate) -> float:
         + math.cos(lat1) * math.cos(lat2) * math.sin(d_lon / 2.0) ** 2
     )
     return 2.0 * EARTH_RADIUS_MILES * math.asin(min(1.0, math.sqrt(hav)))
-
-
-def route_bounds(coordinates: list[Coordinate]) -> dict[str, float]:
-    latitudes = [coordinate.latitude for coordinate in coordinates]
-    longitudes = [coordinate.longitude for coordinate in coordinates]
-    return {
-        "min_latitude": round(min(latitudes), 6),
-        "min_longitude": round(min(longitudes), 6),
-        "max_latitude": round(max(latitudes), 6),
-        "max_longitude": round(max(longitudes), 6),
-    }
-
-
-def build_feature_collection(
-    route_coordinates: list[list[float]],
-    start: Coordinate,
-    finish: Coordinate,
-    stops: list[dict[str, Any]],
-) -> dict[str, Any]:
-    features: list[dict[str, Any]] = [
-        {
-            "type": "Feature",
-            "properties": {"kind": "route"},
-            "geometry": {"type": "LineString", "coordinates": route_coordinates},
-        },
-        {
-            "type": "Feature",
-            "properties": {"kind": "start"},
-            "geometry": {"type": "Point", "coordinates": start.as_geojson_position()},
-        },
-        {
-            "type": "Feature",
-            "properties": {"kind": "finish"},
-            "geometry": {"type": "Point", "coordinates": finish.as_geojson_position()},
-        },
-    ]
-
-    for stop in stops:
-        features.append(
-            {
-                "type": "Feature",
-                "properties": {
-                    "kind": "fuel_stop",
-                    "sequence": stop["sequence"],
-                    "name": stop["truckstop_name"],
-                    "price": stop["price_per_gallon_usd"],
-                    "route_mile": stop["route_mile"],
-                },
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [stop["longitude"], stop["latitude"]],
-                },
-            }
-        )
-
-    return {"type": "FeatureCollection", "features": features}
 
 
 def normalize_location(location: str) -> str:
