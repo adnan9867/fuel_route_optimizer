@@ -3,8 +3,14 @@ from __future__ import annotations
 from decimal import Decimal
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
+
+from route_planner.management.commands.import_fuel_stations import (
+    NOMINATIM_NO_RESULT_SOURCE,
+    geocode_missing_stations,
+)
+from route_planner.models import FuelStation
 
 from .services import (
     CandidateStation,
@@ -167,3 +173,85 @@ class RoutePlanViewTests(SimpleTestCase):
         self.assertEqual(payload["status_code"], 400)
         self.assertIn("start_location", payload["message"])
         self.assertIn("finish_location", payload["message"])
+
+
+class ImportFuelStationsCommandTests(TestCase):
+    def test_skips_existing_geocoded_station_without_nominatim_call(self) -> None:
+        FuelStation.objects.create(
+            opis_truckstop_id="geocoded-1",
+            truckstop_name="Already Geocoded",
+            address="I-80",
+            city="Somewhere",
+            state="PA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+            latitude=Decimal("40.1234567"),
+            longitude=Decimal("-75.1234567"),
+            geocode_source="nominatim",
+        )
+        stdout = CaptureStdout()
+
+        with patch(
+            "route_planner.management.commands.import_fuel_stations._get_json",
+            side_effect=AssertionError("geocoded rows should be skipped"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        self.assertEqual(geocoded, 0)
+        self.assertTrue(
+            any("Skipped 1 already geocoded stations." in line for line in stdout.lines)
+        )
+
+    def test_skips_station_after_nominatim_no_result(self) -> None:
+        station = FuelStation.objects.create(
+            opis_truckstop_id="missing-1",
+            truckstop_name="Missing Station",
+            address="Unknown Exit",
+            city="Nowhere",
+            state="PA",
+            rack_id="1",
+            retail_price=Decimal("3.1000"),
+        )
+        stdout = CaptureStdout()
+
+        with patch(
+            "route_planner.management.commands.import_fuel_stations._get_json",
+            return_value=[],
+        ) as get_json:
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        station.refresh_from_db()
+        self.assertEqual(geocoded, 0)
+        self.assertEqual(station.geocode_source, NOMINATIM_NO_RESULT_SOURCE)
+        self.assertEqual(get_json.call_count, 1)
+
+        with patch(
+            "route_planner.management.commands.import_fuel_stations._get_json",
+            side_effect=AssertionError("processed rows should be skipped"),
+        ):
+            geocoded = geocode_missing_stations(
+                stdout=stdout,
+                success_style=str,
+                warning_style=str,
+            )
+
+        self.assertEqual(geocoded, 0)
+        self.assertTrue(
+            any("Skipped 1 previously processed stations." in line for line in stdout.lines)
+        )
+
+
+class CaptureStdout:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def write(self, value: str) -> None:
+        self.lines.append(value)

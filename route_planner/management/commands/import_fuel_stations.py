@@ -16,6 +16,9 @@ from route_planner.services import _get_json
 
 NOMINATIM_SLEEP_SECONDS = 1.0
 GEOCODE_PROGRESS_INTERVAL = 25
+NOMINATIM_SOURCE = "nominatim"
+NOMINATIM_NO_RESULT_SOURCE = "nominatim-no-result"
+PROCESSED_GEOCODE_SOURCES = (NOMINATIM_SOURCE, NOMINATIM_NO_RESULT_SOURCE)
 
 
 class Command(BaseCommand):
@@ -102,17 +105,36 @@ def clean(value: object) -> str:
 
 
 def geocode_missing_stations(stdout, success_style, warning_style) -> int:
-    queryset = FuelStation.objects.filter(
+    already_geocoded = FuelStation.objects.filter(
+        is_active=True,
+        latitude__isnull=False,
+        longitude__isnull=False,
+    ).count()
+    if already_geocoded:
+        stdout.write(success_style(f"Skipped {already_geocoded} already geocoded stations."))
+
+    missing_queryset = FuelStation.objects.filter(
         is_active=True,
         latitude__isnull=True,
         longitude__isnull=True,
+    )
+    queryset = missing_queryset.exclude(
+        geocode_source__in=PROCESSED_GEOCODE_SOURCES,
     ).order_by("id")
+    skipped_previously_processed = missing_queryset.count() - queryset.count()
     total = queryset.count()
+    if skipped_previously_processed:
+        stdout.write(
+            success_style(
+                f"Skipped {skipped_previously_processed} previously processed stations."
+            )
+        )
     if total == 0:
         stdout.write(success_style("No fuel stations are missing coordinates."))
         return 0
 
     updated = 0
+    no_result = 0
     stdout.write(
         f"Geocoding {total} fuel stations with Nominatim "
         f"(sleep={NOMINATIM_SLEEP_SECONDS}s between requests)."
@@ -122,7 +144,7 @@ def geocode_missing_stations(stdout, success_style, warning_style) -> int:
         if payload:
             station.latitude = Decimal(payload[0]["lat"]).quantize(Decimal("0.0000001"))
             station.longitude = Decimal(payload[0]["lon"]).quantize(Decimal("0.0000001"))
-            station.geocode_source = "nominatim"
+            station.geocode_source = NOMINATIM_SOURCE
             station.geocoded_at = timezone.now()
             station.save(
                 update_fields=[
@@ -136,6 +158,16 @@ def geocode_missing_stations(stdout, success_style, warning_style) -> int:
             updated += 1
             status = "geocoded"
         else:
+            station.geocode_source = NOMINATIM_NO_RESULT_SOURCE
+            station.geocoded_at = timezone.now()
+            station.save(
+                update_fields=[
+                    "geocode_source",
+                    "geocoded_at",
+                    "updated_at",
+                ]
+            )
+            no_result += 1
             status = "no result"
 
         if index == 1 or index == total or index % GEOCODE_PROGRESS_INTERVAL == 0:
@@ -145,10 +177,11 @@ def geocode_missing_stations(stdout, success_style, warning_style) -> int:
             )
         time.sleep(NOMINATIM_SLEEP_SECONDS)
 
-    if updated < total:
+    if no_result:
         stdout.write(
             warning_style(
-                f"Nominatim returned no result for {total - updated} fuel stations."
+                f"Nominatim returned no result for {no_result} fuel stations. "
+                "They are marked and will be skipped on the next import."
             )
         )
     return updated
