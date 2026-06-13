@@ -13,20 +13,60 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 import os
 from pathlib import Path
 
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
+from django.core.exceptions import ImproperlyConfigured
+
+# Build paths inside the project like this: BASE_DIR / 'subdir'.``
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def env_list(name: str, default: list[str]) -> list[str]:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return [item.strip() for item in value.split(',') if item.strip()]
+
+
+load_env_file(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-ff=@!ba)#yp0okpisijs=l3y4xse^q*5k4+z%%h)@kyk_&w-_='
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+if not SECRET_KEY:
+    raise ImproperlyConfigured('DJANGO_SECRET_KEY must be set in the environment or .env file.')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env_bool('DJANGO_DEBUG', True)
 
-ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'testserver']
+ALLOWED_HOSTS = env_list(
+    'DJANGO_ALLOWED_HOSTS',
+    ['127.0.0.1', 'localhost', 'testserver'],
+)
 
 
 # Application definition
@@ -114,13 +154,7 @@ ROUTE_PLANNER_ROUTE_TIMEOUT_SECONDS = 12
 ROUTE_PLANNER_STATION_GEOCODE_TIMEOUT_SECONDS = 6
 _GEOCODIO_API_KEYS = os.environ.get(
     'GEOCODIO_API_KEYS',
-    os.environ.get(
-        'GEOCODIO_API_KEY',
-        (
-            '3bae2cfa8f3eae96efa9abc96b26be2c7b63aeb,'
-            '46e0667b5b0b69b0b2b9bb22441bb9e11abeaba'
-        ),
-    ),
+    os.environ.get('GEOCODIO_API_KEY', ''),
 )
 GEOCODIO_API_KEYS = [
     key.strip()
