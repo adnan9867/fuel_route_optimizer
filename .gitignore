@@ -4,3 +4,4 @@ db.sqlite3
 route_detection_data_tmp/
 venv/
 .env
+.idea
